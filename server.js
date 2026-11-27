@@ -1,350 +1,174 @@
-import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const express = require('express');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const INTERVAL_MS = 5000; // 5-second delay between requests
-const REQUEST_TIMEOUT_MS = 30000;
 
-app.disable("etag");
-app.use(express.json({ limit: "256kb" }));
-app.use(express.static(path.join(__dirname, "public")));
+const EQOPAY_URL = 'https://api.eqopay.co.ke/v1/stkpush';
+const EQOPAY_API_KEY = process.env.EQOPAY_API_KEY || '';
+const EQOPAY_EMAIL = process.env.EQOPAY_EMAIL || '';
 
-app.use("/api", (req, res, next) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-  next();
-});
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// In-memory queue, error tracking & run state
-let queue = [];
-let isProcessing = false;
-let shouldStop = false;
-let recentLogs = [];
-const knownErrorNumbers = new Set();
-
-function logEvent(level, message, details = null) {
-  const timestamp = new Date().toISOString();
-  const formattedDetails =
-    details !== null
-      ? typeof details === "string"
-        ? details
-        : JSON.stringify(details)
-      : "";
-
-  const line = `[${timestamp}] [${level}] ${message}${
-    formattedDetails ? ` | ${formattedDetails}` : ""
-  }`;
-
-  if (level === "ERROR") {
-    console.error(line);
-  } else {
-    console.log(line);
-  }
-
-  recentLogs.unshift({ timestamp, level, message, details });
-  if (recentLogs.length > 100) recentLogs.pop();
-}
-
-process.on("unhandledRejection", (reason) => {
-  logEvent("ERROR", "Unhandled Promise Rejection", {
-    reason: reason instanceof Error ? reason.message : String(reason),
-  });
-});
+// In-memory job state
+let jobState = {
+  running: false,
+  total: 0,
+  processed: 0,
+  logs: []
+};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function normalize254Number(raw) {
-  let cleaned = String(raw ?? "").trim().replace(/^\+/, "").replace(/\s+/g, "");
-  if (/^0(7|1)\d{8}$/.test(cleaned)) {
-    cleaned = `254${cleaned.slice(1)}`;
+// Normalize phone numbers to 07XXXXXXXX or 01XXXXXXXX format
+function formatMsisdn(raw) {
+  const digits = raw.replace(/\D/g, '');
+  if (digits.startsWith('254') && digits.length === 12) {
+    return '0' + digits.slice(3);
   }
-  return /^254(7|1)\d{8}$/.test(cleaned) ? cleaned : null;
+  if ((digits.startsWith('7') || digits.startsWith('1')) && digits.length === 9) {
+    return '0' + digits;
+  }
+  return digits;
 }
 
-function sanitizeReferencePrefix(prefix) {
-  const cleaned = String(prefix || "ORD")
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]/g, "")
-    .slice(0, 12);
-  return cleaned || "ORD";
-}
+// Health check endpoint (useful for Render & uptime monitors)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', running: jobState.running });
+});
 
-async function sendSingleStkPush(item) {
-  const apiKey = process.env.EQOPAY_API_KEY?.trim();
-  const email = process.env.EQOPAY_EMAIL?.trim();
+// Get live batch status for the UI
+app.get('/api/status', (req, res) => {
+  res.json(jobState);
+});
 
-  if (!apiKey || !email) {
-    logEvent(
-      "ERROR",
-      "Missing environment variables: EQOPAY_API_KEY or EQOPAY_EMAIL is not set on Render.",
-      { hasApiKey: Boolean(apiKey), hasEmail: Boolean(email) }
-    );
-    return;
+// Start sequential STK push batch
+app.post('/api/start', async (req, res) => {
+  if (jobState.running) {
+    return res.status(409).json({ error: 'A batch is already running. Wait for it to finish.' });
   }
 
-  if (knownErrorNumbers.has(item.msisdn)) {
-    logEvent("INFO", `Skipping known error number ${item.msisdn}`);
-    return;
+  if (!EQOPAY_API_KEY || !EQOPAY_EMAIL) {
+    const msg = 'Missing EQOPAY_API_KEY or EQOPAY_EMAIL in server environment variables.';
+    console.error(`[CONFIG ERROR] ${msg}`);
+    return res.status(500).json({ error: msg });
   }
 
-  const payload = {
-    api_key: apiKey,
-    email: email,
-    amount: String(item.amount),
-    msisdn: item.msisdn,
-    reference: item.reference,
+  const { numbers, amount, referencePrefix } = req.body;
+
+  if (!Array.isArray(numbers) || numbers.length === 0) {
+    return res.status(400).json({ error: 'Provide at least one phone number.' });
+  }
+
+  const parsedAmount = String(amount || '100').trim();
+  const prefix = String(referencePrefix || 'ORDER').trim();
+
+  const cleanedNumbers = numbers
+    .map((n) => formatMsisdn(String(n)))
+    .filter((n) => n.length >= 10);
+
+  if (cleanedNumbers.length === 0) {
+    return res.status(400).json({ error: 'No valid phone numbers found after formatting.' });
+  }
+
+  jobState = {
+    running: true,
+    total: cleanedNumbers.length,
+    processed: 0,
+    logs: []
   };
 
-  if (item.accountNumber) {
-    payload.account_number = item.accountNumber;
-  }
+  res.json({ message: 'Batch started', total: cleanedNumbers.length });
 
-  logEvent("INFO", `Calling EQOPAY /v1/stkpush for ${item.msisdn}`, {
-    amount: payload.amount,
-    reference: payload.reference,
-    email,
-  });
+  // Run sequential loop in background
+  (async () => {
+    console.log(`\n=== [BATCH STARTED] Total numbers: ${cleanedNumbers.length} | Amount: KES ${parsedAmount} ===`);
 
-  try {
-    const response = await fetch("https://api.eqopay.co.ke/v1/stkpush", {
-      method: "POST",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "Cache-Control": "no-cache",
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    for (let i = 0; i < cleanedNumbers.length; i++) {
+      const msisdn = cleanedNumbers[i];
+      const reference = `${prefix}-${Date.now()}-${i + 1}`;
+      const payload = {
+        api_key: EQOPAY_API_KEY,
+        email: EQOPAY_EMAIL,
+        amount: parsedAmount,
+        msisdn,
+        reference
+      };
 
-    const rawText = await response.text();
-    let parsedBody;
-    try {
-      parsedBody = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      parsedBody = { rawResponse: rawText };
-    }
+      console.log(`[${i + 1}/${cleanedNumbers.length}] Sending STK Push to ${msisdn} (Ref: ${reference})...`);
 
-    if (response.status === 304) {
-      logEvent("ERROR", `EQOPAY returned HTTP 304 for ${item.msisdn}`, {
-        status: response.status,
-        body: parsedBody,
-      });
-      return;
-    }
+      try {
+        const response = await fetch(EQOPAY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
 
-    const accepted =
-      response.ok &&
-      (String(parsedBody?.ResponseCode) === "0" ||
-        String(parsedBody?.success) === "200");
+        const rawText = await response.text();
+        let data;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          data = { rawResponse: rawText };
+        }
 
-    if (!accepted) {
-      knownErrorNumbers.add(item.msisdn);
-      logEvent(
-        "ERROR",
-        `EQOPAY did not accept STK Push for ${item.msisdn} (HTTP ${response.status})`,
-        parsedBody
-      );
-    } else {
-      logEvent(
-        "SUCCESS",
-        `STK Push accepted for ${item.msisdn}`,
-        parsedBody
-      );
-    }
-  } catch (err) {
-    knownErrorNumbers.add(item.msisdn);
-    logEvent("ERROR", `Fetch/Network error sending STK Push to ${item.msisdn}`, {
-      errorName: err?.name,
-      errorMessage: err?.message,
-      cause: err?.cause ? String(err.cause) : undefined,
-    });
-  }
-}
+        if (!response.ok || (data.ResponseCode && String(data.ResponseCode) !== '0')) {
+          const errDetail = `HTTP ${response.status} | Response: ${JSON.stringify(data)}`;
+          console.error(`[STK ERROR] Number: ${msisdn} | Ref: ${reference} | ${errDetail}`);
+          jobState.logs.push({
+            index: i + 1,
+            msisdn,
+            reference,
+            status: 'FAILED',
+            detail: errDetail,
+            time: new Date().toISOString()
+          });
+        } else {
+          const okDetail = data.message || 'STK Push dispatched';
+          console.log(`[STK SUCCESS] Number: ${msisdn} | RequestID: ${data.transaction_request_id || 'N/A'} | ${okDetail}`);
+          jobState.logs.push({
+            index: i + 1,
+            msisdn,
+            reference,
+            status: 'SENT',
+            detail: okDetail,
+            time: new Date().toISOString()
+          });
+        }
+      } catch (err) {
+        const netErr = err.stack || err.message || String(err);
+        console.error(`[NETWORK/FETCH ERROR] Number: ${msisdn} | Ref: ${reference}\n${netErr}`);
+        jobState.logs.push({
+          index: i + 1,
+          msisdn,
+          reference,
+          status: 'ERROR',
+          detail: err.message || 'Network failure',
+          time: new Date().toISOString()
+        });
+      }
 
-async function processQueue() {
-  if (isProcessing) {
-    logEvent("INFO", `Queue worker already running. Pending: ${queue.length}`);
-    return;
-  }
-  isProcessing = true;
-  shouldStop = false;
+      jobState.processed = i + 1;
 
-  logEvent("INFO", `Queue worker started. Items pending: ${queue.length}`);
-
-  try {
-    while (queue.length > 0 && !shouldStop) {
-      const nextItem = queue.shift();
-      await sendSingleStkPush(nextItem);
-
-      if (queue.length > 0 && !shouldStop) {
-        logEvent("INFO", `Waiting ${INTERVAL_MS / 1000}s before next request...`);
-        await sleep(INTERVAL_MS);
+      // Wait 5 seconds before sending the next request (skip delay after the last number)
+      if (i < cleanedNumbers.length - 1) {
+        console.log(`Waiting 5 seconds before next request...`);
+        await sleep(5000);
       }
     }
-  } catch (err) {
-    logEvent("ERROR", "Unexpected error inside processQueue loop", {
-      errorMessage: err?.message || String(err),
-    });
-  } finally {
-    isProcessing = false;
-    logEvent(
-      "INFO",
-      shouldStop
-        ? `Queue worker stopped manually. Remaining items: ${queue.length}`
-        : "Queue worker finished all items."
-    );
-  }
-}
 
-// Health endpoint for Render & uptime monitors
-app.get("/health", (req, res) => {
-  res.set("Cache-Control", "no-store");
-  res.status(200).json({
-    status: "ok",
-    isProcessing,
-    queuedCount: queue.length,
-    knownErrorCount: knownErrorNumbers.size,
-    envConfigured: Boolean(
-      process.env.EQOPAY_API_KEY?.trim() && process.env.EQOPAY_EMAIL?.trim()
-    ),
-  });
+    jobState.running = false;
+    console.log(`=== [BATCH COMPLETED] Processed ${jobState.processed}/${jobState.total} ===\n`);
+  })();
 });
 
-// Direct single-number test endpoint for fast Render log verification
-app.post("/api/test-stk", async (req, res) => {
-  const normalized = normalize254Number(req.body?.msisdn);
-  const amount = Math.max(1, Math.round(Number(req.body?.amount) || 1));
-
-  if (!normalized) {
-    logEvent("ERROR", "Test STK rejected: invalid phone number", {
-      raw: req.body?.msisdn,
-    });
-    return res.status(400).json({ error: "Invalid phone number." });
-  }
-
-  knownErrorNumbers.delete(normalized);
-  await sendSingleStkPush({
-    msisdn: normalized,
-    amount,
-    reference: `TEST-${Date.now().toString().slice(-6)}`,
-    accountNumber: req.body?.accountNumber ? String(req.body.accountNumber).trim() : "",
-  });
-
-  const latestLog = recentLogs[0] || null;
-  return res.status(200).json({ ok: true, msisdn: normalized, latestLog });
-});
-
-// Enqueue phone numbers (ignores invalid & previously errored numbers)
-app.post("/api/enqueue", (req, res) => {
-  const { numbers, amount, referencePrefix, accountNumber } = req.body ?? {};
-  logEvent("INFO", "Received /api/enqueue request", {
-    rawCount: Array.isArray(numbers) ? numbers.length : 0,
-    amount,
-    referencePrefix,
-  });
-
-  if (!Array.isArray(numbers)) {
-    logEvent("ERROR", "/api/enqueue rejected: numbers is not an array");
-    return res.status(400).json({ error: "numbers must be an array." });
-  }
-
-  const numericAmount = Number(amount);
-  if (!Number.isFinite(numericAmount) || numericAmount < 1) {
-    logEvent("ERROR", "/api/enqueue rejected: invalid amount", { amount });
-    return res.status(400).json({ error: "Amount must be at least 1 KES." });
-  }
-
-  const refBase = sanitizeReferencePrefix(referencePrefix);
-  const seenInBatch = new Set();
-  const validItems = [];
-  let ignoredInvalidCount = 0;
-  let ignoredErrorCount = 0;
-  let duplicatesSkipped = 0;
-
-  numbers.forEach((raw, idx) => {
-    const trimmed = String(raw ?? "").trim();
-    if (!trimmed) return;
-
-    const normalized = normalize254Number(trimmed);
-    if (!normalized) {
-      ignoredInvalidCount += 1;
-      return;
-    }
-
-    if (knownErrorNumbers.has(normalized)) {
-      ignoredErrorCount += 1;
-      return;
-    }
-
-    if (seenInBatch.has(normalized)) {
-      duplicatesSkipped += 1;
-      return;
-    }
-    seenInBatch.add(normalized);
-
-    validItems.push({
-      msisdn: normalized,
-      amount: Math.round(numericAmount),
-      reference: `${refBase}-${Date.now().toString().slice(-5)}-${idx + 1}`,
-      accountNumber: accountNumber ? String(accountNumber).trim() : "",
-    });
-  });
-
-  if (validItems.length > 0) {
-    queue.push(...validItems);
-    processQueue();
-  }
-
-  logEvent("INFO", `Enqueue processed: ${validItems.length} added`, {
-    ignoredInvalidCount,
-    ignoredErrorCount,
-    duplicatesSkipped,
-    totalInQueue: queue.length,
-  });
-
-  return res.status(200).json({
-    queued: validItems.length,
-    ignoredInvalidCount,
-    ignoredErrorCount,
-    duplicatesSkipped,
-    totalInQueue: queue.length,
-  });
-});
-
-// Stop & clear queue
-app.post("/api/stop", (req, res) => {
-  shouldStop = true;
-  const cleared = queue.length;
-  queue = [];
-  logEvent("INFO", `Stop requested. Cleared ${cleared} pending item(s).`);
-  res.status(200).json({ stopped: true, cleared });
-});
-
-// Status & live logs for the UI
-app.get("/api/status", (req, res) => {
-  res.status(200).json({
-    isProcessing,
-    queuedCount: queue.length,
-    knownErrorNumbers: Array.from(knownErrorNumbers),
-    nextNumbers: queue.slice(0, 10).map((i) => i.msisdn),
-    logs: recentLogs,
-  });
+// Optional webhook receiver to log callback results in Render
+app.post('/webhook/eqopay', (req, res) => {
+  console.log('[EQOPAY WEBHOOK RECEIVED]', JSON.stringify(req.body));
+  res.status(200).json({ received: true });
 });
 
 app.listen(PORT, () => {
-  logEvent("INFO", `EQOPAY STK Bot listening on port ${PORT}`);
-  if (!process.env.EQOPAY_API_KEY?.trim() || !process.env.EQOPAY_EMAIL?.trim()) {
-    logEvent(
-      "ERROR",
-      "Startup Warning: EQOPAY_API_KEY or EQOPAY_EMAIL environment variable is missing!"
-    );
-  }
+  console.log(`Server running on port ${PORT}`);
 });
