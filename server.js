@@ -10,14 +10,23 @@ const PORT = process.env.PORT || 3000;
 const INTERVAL_MS = 5000; // 5-second delay between requests
 const REQUEST_TIMEOUT_MS = 30000;
 
+app.disable("etag");
 app.use(express.json({ limit: "256kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-// In-memory queue & run state
+app.use("/api", (req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+});
+
+// In-memory queue, error tracking & run state
 let queue = [];
 let isProcessing = false;
 let shouldStop = false;
 let recentLogs = [];
+const knownErrorNumbers = new Set();
 
 function logEvent(level, message, details = null) {
   const timestamp = new Date().toISOString();
@@ -68,6 +77,11 @@ async function sendSingleStkPush(item) {
     return;
   }
 
+  if (knownErrorNumbers.has(item.msisdn)) {
+    logEvent("INFO", `Skipping known error number ${item.msisdn}`);
+    return;
+  }
+
   const payload = {
     api_key: apiKey,
     email: email,
@@ -88,26 +102,34 @@ async function sendSingleStkPush(item) {
   try {
     const response = await fetch("https://api.eqopay.co.ke/v1/stkpush", {
       method: "POST",
+      cache: "no-store",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        "Cache-Control": "no-cache",
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
+    if (response.status === 304) {
+      logEvent("WARN", `Received HTTP 304 Not Modified for ${item.msisdn} (empty body)`);
+      return;
+    }
+
     const rawText = await response.text();
     let parsedBody;
     try {
-      parsedBody = JSON.parse(rawText);
+      parsedBody = rawText ? JSON.parse(rawText) : {};
     } catch {
       parsedBody = { rawResponse: rawText };
     }
 
     if (!response.ok || String(parsedBody?.ResponseCode) !== "0") {
+      knownErrorNumbers.add(item.msisdn);
       logEvent(
         "ERROR",
-        `EQOPAY API rejected request for ${item.msisdn} (HTTP ${response.status})`,
+        `EQOPAY API rejected request for ${item.msisdn} (HTTP ${response.status}) - marked as error number`,
         parsedBody
       );
     } else {
@@ -118,7 +140,8 @@ async function sendSingleStkPush(item) {
       );
     }
   } catch (err) {
-    logEvent("ERROR", `Network/Fetch failure for ${item.msisdn}`, {
+    knownErrorNumbers.add(item.msisdn);
+    logEvent("ERROR", `Network/Fetch failure for ${item.msisdn} - marked as error number`, {
       errorName: err.name,
       errorMessage: err.message,
       cause: err.cause ? String(err.cause) : undefined,
@@ -156,20 +179,22 @@ async function processQueue() {
 
 // Health endpoint for Render & uptime monitors
 app.get("/health", (req, res) => {
+  res.set("Cache-Control", "no-store");
   res.status(200).json({
     status: "ok",
     isProcessing,
     queuedCount: queue.length,
+    knownErrorCount: knownErrorNumbers.size,
     envConfigured: Boolean(process.env.EQOPAY_API_KEY && process.env.EQOPAY_EMAIL),
   });
 });
 
-// Enqueue phone numbers
+// Enqueue phone numbers (ignores invalid & previously errored numbers)
 app.post("/api/enqueue", (req, res) => {
   const { numbers, amount, referencePrefix, accountNumber } = req.body ?? {};
 
-  if (!Array.isArray(numbers) || numbers.length === 0) {
-    return res.status(400).json({ error: "Provide at least one phone number." });
+  if (!Array.isArray(numbers)) {
+    return res.status(400).json({ error: "numbers must be an array." });
   }
 
   const numericAmount = Number(amount);
@@ -180,7 +205,8 @@ app.post("/api/enqueue", (req, res) => {
   const refBase = sanitizeReferencePrefix(referencePrefix);
   const seenInBatch = new Set();
   const validItems = [];
-  let ignoredCount = 0;
+  let ignoredInvalidCount = 0;
+  let ignoredErrorCount = 0;
   let duplicatesSkipped = 0;
 
   numbers.forEach((raw, idx) => {
@@ -188,7 +214,12 @@ app.post("/api/enqueue", (req, res) => {
     if (!cleaned) return;
 
     if (!isValid254Number(cleaned)) {
-      ignoredCount += 1;
+      ignoredInvalidCount += 1;
+      return;
+    }
+
+    if (knownErrorNumbers.has(cleaned)) {
+      ignoredErrorCount += 1;
       return;
     }
 
@@ -206,24 +237,22 @@ app.post("/api/enqueue", (req, res) => {
     });
   });
 
-  if (validItems.length === 0) {
-    return res.status(400).json({
-      error: "No valid numbers starting with 254 (12 digits, e.g., 254712345678).",
-    });
+  if (validItems.length > 0) {
+    queue.push(...validItems);
+    processQueue();
   }
 
-  queue.push(...validItems);
-  logEvent("INFO", `Enqueued ${validItems.length} number(s)`, {
-    ignoredCount,
+  logEvent("INFO", `Enqueue processed: ${validItems.length} added`, {
+    ignoredInvalidCount,
+    ignoredErrorCount,
     duplicatesSkipped,
     totalInQueue: queue.length,
   });
 
-  processQueue();
-
-  res.status(200).json({
+  return res.status(200).json({
     queued: validItems.length,
-    ignoredCount,
+    ignoredInvalidCount,
+    ignoredErrorCount,
     duplicatesSkipped,
     totalInQueue: queue.length,
   });
@@ -243,6 +272,7 @@ app.get("/api/status", (req, res) => {
   res.status(200).json({
     isProcessing,
     queuedCount: queue.length,
+    knownErrorNumbers: Array.from(knownErrorNumbers),
     nextNumbers: queue.slice(0, 10).map((i) => i.msisdn),
     logs: recentLogs,
   });
