@@ -1,16 +1,15 @@
 {
   "name": "eqopay-stk-bot",
   "version": "1.0.0",
-  "description": "Sequential M-Pesa STK Push dispatcher for EQOPAY",
+  "description": "Sequential EQOPAY STK Push dispatcher with web UI",
   "main": "server.js",
-  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
