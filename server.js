@@ -8,8 +8,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 const INTERVAL_MS = 5000; // 5-second delay between requests
+const REQUEST_TIMEOUT_MS = 30000;
 
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // In-memory queue & run state
@@ -45,6 +46,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isValid254Number(msisdn) {
   return /^254(7|1)\d{8}$/.test(msisdn);
+}
+
+function sanitizeReferencePrefix(prefix) {
+  const cleaned = String(prefix || "ORD")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 12);
+  return cleaned || "ORD";
 }
 
 async function sendSingleStkPush(item) {
@@ -84,6 +93,7 @@ async function sendSingleStkPush(item) {
         Accept: "application/json",
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
     const rawText = await response.text();
@@ -123,23 +133,25 @@ async function processQueue() {
 
   logEvent("INFO", `Queue worker started. Items pending: ${queue.length}`);
 
-  while (queue.length > 0 && !shouldStop) {
-    const nextItem = queue.shift();
-    await sendSingleStkPush(nextItem);
+  try {
+    while (queue.length > 0 && !shouldStop) {
+      const nextItem = queue.shift();
+      await sendSingleStkPush(nextItem);
 
-    if (queue.length > 0 && !shouldStop) {
-      logEvent("INFO", `Waiting ${INTERVAL_MS / 1000}s before next request...`);
-      await sleep(INTERVAL_MS);
+      if (queue.length > 0 && !shouldStop) {
+        logEvent("INFO", `Waiting ${INTERVAL_MS / 1000}s before next request...`);
+        await sleep(INTERVAL_MS);
+      }
     }
+  } finally {
+    isProcessing = false;
+    logEvent(
+      "INFO",
+      shouldStop
+        ? `Queue worker stopped manually. Remaining items: ${queue.length}`
+        : "Queue worker finished all items."
+    );
   }
-
-  isProcessing = false;
-  logEvent(
-    "INFO",
-    shouldStop
-      ? `Queue worker stopped manually. Remaining items: ${queue.length}`
-      : "Queue worker finished all items."
-  );
 }
 
 // Health endpoint for Render & uptime monitors
@@ -154,7 +166,7 @@ app.get("/health", (req, res) => {
 
 // Enqueue phone numbers
 app.post("/api/enqueue", (req, res) => {
-  const { numbers, amount, referencePrefix, accountNumber } = req.body;
+  const { numbers, amount, referencePrefix, accountNumber } = req.body ?? {};
 
   if (!Array.isArray(numbers) || numbers.length === 0) {
     return res.status(400).json({ error: "Provide at least one phone number." });
@@ -165,39 +177,45 @@ app.post("/api/enqueue", (req, res) => {
     return res.status(400).json({ error: "Amount must be at least 1 KES." });
   }
 
+  const refBase = sanitizeReferencePrefix(referencePrefix);
+  const seenInBatch = new Set();
   const validItems = [];
-  const invalidNumbers = [];
+  let ignoredCount = 0;
+  let duplicatesSkipped = 0;
 
   numbers.forEach((raw, idx) => {
-    const cleaned = String(raw).trim().replace(/^\+/, "");
+    const cleaned = String(raw ?? "").trim().replace(/^\+/, "");
     if (!cleaned) return;
 
-    if (isValid254Number(cleaned)) {
-      const refBase = (referencePrefix || "ORD").trim();
-      validItems.push({
-        msisdn: cleaned,
-        amount: Math.round(numericAmount),
-        reference: `${refBase}-${Date.now().toString().slice(-5)}-${idx + 1}`,
-        accountNumber: accountNumber ? String(accountNumber).trim() : "",
-      });
-    } else {
-      invalidNumbers.push(raw);
+    if (!isValid254Number(cleaned)) {
+      ignoredCount += 1;
+      return;
     }
+
+    if (seenInBatch.has(cleaned)) {
+      duplicatesSkipped += 1;
+      return;
+    }
+    seenInBatch.add(cleaned);
+
+    validItems.push({
+      msisdn: cleaned,
+      amount: Math.round(numericAmount),
+      reference: `${refBase}-${Date.now().toString().slice(-5)}-${idx + 1}`,
+      accountNumber: accountNumber ? String(accountNumber).trim() : "",
+    });
   });
 
   if (validItems.length === 0) {
-    logEvent("ERROR", "Enqueue rejected: no valid 254XXXXXXXXX numbers found", {
-      invalidNumbers,
-    });
     return res.status(400).json({
       error: "No valid numbers starting with 254 (12 digits, e.g., 254712345678).",
-      invalidNumbers,
     });
   }
 
   queue.push(...validItems);
   logEvent("INFO", `Enqueued ${validItems.length} number(s)`, {
-    invalidSkipped: invalidNumbers.length,
+    ignoredCount,
+    duplicatesSkipped,
     totalInQueue: queue.length,
   });
 
@@ -205,7 +223,8 @@ app.post("/api/enqueue", (req, res) => {
 
   res.status(200).json({
     queued: validItems.length,
-    invalidNumbers,
+    ignoredCount,
+    duplicatesSkipped,
     totalInQueue: queue.length,
   });
 });
