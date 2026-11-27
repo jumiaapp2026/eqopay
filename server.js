@@ -55,7 +55,7 @@ app.post('/api/start', async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 
-  const { numbers, amount, referencePrefix } = req.body;
+  const { numbers, amount, referencePrefix, accountNumber } = req.body;
 
   if (!Array.isArray(numbers) || numbers.length === 0) {
     return res.status(400).json({ error: 'Provide at least one phone number.' });
@@ -63,6 +63,7 @@ app.post('/api/start', async (req, res) => {
 
   const parsedAmount = String(amount || '100').trim();
   const prefix = String(referencePrefix || 'ORDER').trim();
+  const cleanAccountNumber = accountNumber ? String(accountNumber).trim() : '';
 
   const cleanedNumbers = numbers
     .map((n) => formatMsisdn(String(n)))
@@ -83,7 +84,9 @@ app.post('/api/start', async (req, res) => {
 
   // Run sequential loop in background
   (async () => {
-    console.log(`\n=== [BATCH STARTED] Total numbers: ${cleanedNumbers.length} | Amount: KES ${parsedAmount} ===`);
+    console.log(
+      `\n=== [BATCH STARTED] Total numbers: ${cleanedNumbers.length} | Amount: KES ${parsedAmount} | Account: ${cleanAccountNumber || 'N/A'} ===`
+    );
 
     for (let i = 0; i < cleanedNumbers.length; i++) {
       const msisdn = cleanedNumbers[i];
@@ -93,10 +96,13 @@ app.post('/api/start', async (req, res) => {
         email: EQOPAY_EMAIL,
         amount: parsedAmount,
         msisdn,
-        reference
+        reference,
+        ...(cleanAccountNumber ? { account_number: cleanAccountNumber } : {})
       };
 
-      console.log(`[${i + 1}/${cleanedNumbers.length}] Sending STK Push to ${msisdn} (Ref: ${reference})...`);
+      console.log(
+        `[${i + 1}/${cleanedNumbers.length}] Sending STK Push to ${msisdn} | Ref: ${reference} | Account: ${cleanAccountNumber || 'N/A'}...`
+      );
 
       try {
         const response = await fetch(EQOPAY_URL, {
@@ -114,23 +120,27 @@ app.post('/api/start', async (req, res) => {
         }
 
         if (!response.ok || (data.ResponseCode && String(data.ResponseCode) !== '0')) {
-          const errDetail = `HTTP ${response.status} | Response: ${JSON.stringify(data)}`;
+          const errDetail = `HTTP ${response.status} | Account: ${cleanAccountNumber || 'N/A'} | Response: ${JSON.stringify(data)}`;
           console.error(`[STK ERROR] Number: ${msisdn} | Ref: ${reference} | ${errDetail}`);
           jobState.logs.push({
             index: i + 1,
             msisdn,
             reference,
+            accountNumber: cleanAccountNumber,
             status: 'FAILED',
             detail: errDetail,
             time: new Date().toISOString()
           });
         } else {
-          const okDetail = data.message || 'STK Push dispatched';
-          console.log(`[STK SUCCESS] Number: ${msisdn} | RequestID: ${data.transaction_request_id || 'N/A'} | ${okDetail}`);
+          const okDetail = `${data.message || 'STK Push dispatched'}${cleanAccountNumber ? ` (Acc: ${cleanAccountNumber})` : ''}`;
+          console.log(
+            `[STK SUCCESS] Number: ${msisdn} | Account: ${cleanAccountNumber || 'N/A'} | RequestID: ${data.transaction_request_id || 'N/A'} | ${okDetail}`
+          );
           jobState.logs.push({
             index: i + 1,
             msisdn,
             reference,
+            accountNumber: cleanAccountNumber,
             status: 'SENT',
             detail: okDetail,
             time: new Date().toISOString()
@@ -138,11 +148,14 @@ app.post('/api/start', async (req, res) => {
         }
       } catch (err) {
         const netErr = err.stack || err.message || String(err);
-        console.error(`[NETWORK/FETCH ERROR] Number: ${msisdn} | Ref: ${reference}\n${netErr}`);
+        console.error(
+          `[NETWORK/FETCH ERROR] Number: ${msisdn} | Ref: ${reference} | Account: ${cleanAccountNumber || 'N/A'}\n${netErr}`
+        );
         jobState.logs.push({
           index: i + 1,
           msisdn,
           reference,
+          accountNumber: cleanAccountNumber,
           status: 'ERROR',
           detail: err.message || 'Network failure',
           time: new Date().toISOString()
@@ -153,7 +166,7 @@ app.post('/api/start', async (req, res) => {
 
       // Wait 5 seconds before sending the next request (skip delay after the last number)
       if (i < cleanedNumbers.length - 1) {
-        console.log(`Waiting 5 seconds before next request...`);
+        console.log('Waiting 5 seconds before next request...');
         await sleep(5000);
       }
     }
