@@ -42,6 +42,9 @@
       </div>
     </div>
 
+    <label for="accountNumber">Paybill Account Number (required for Paybill, optional for Till)</label>
+    <input type="text" id="accountNumber" placeholder="e.g. ACC-001 or Meter/Invoice No." />
+
     <button id="startBtn" onclick="startBatch()">Start STK Push Queue</button>
 
     <div class="status-bar" id="statusText">Idle — Ready to send.</div>
@@ -55,6 +58,7 @@
       const raw = document.getElementById('numbers').value;
       const amount = document.getElementById('amount').value;
       const referencePrefix = document.getElementById('prefix').value;
+      const accountNumber = document.getElementById('accountNumber').value.trim();
 
       const numbers = raw
         .split(/[\n,]+/)
@@ -74,7 +78,7 @@
         const res = await fetch('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ numbers, amount, referencePrefix })
+          body: JSON.stringify({ numbers, amount, referencePrefix, accountNumber })
         });
         const data = await res.json();
 
