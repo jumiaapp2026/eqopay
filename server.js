@@ -51,10 +51,20 @@ function logEvent(level, message, details = null) {
   if (recentLogs.length > 100) recentLogs.pop();
 }
 
+process.on("unhandledRejection", (reason) => {
+  logEvent("ERROR", "Unhandled Promise Rejection", {
+    reason: reason instanceof Error ? reason.message : String(reason),
+  });
+});
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function isValid254Number(msisdn) {
-  return /^254(7|1)\d{8}$/.test(msisdn);
+function normalize254Number(raw) {
+  let cleaned = String(raw ?? "").trim().replace(/^\+/, "").replace(/\s+/g, "");
+  if (/^0(7|1)\d{8}$/.test(cleaned)) {
+    cleaned = `254${cleaned.slice(1)}`;
+  }
+  return /^254(7|1)\d{8}$/.test(cleaned) ? cleaned : null;
 }
 
 function sanitizeReferencePrefix(prefix) {
@@ -66,13 +76,14 @@ function sanitizeReferencePrefix(prefix) {
 }
 
 async function sendSingleStkPush(item) {
-  const apiKey = process.env.EQOPAY_API_KEY;
-  const email = process.env.EQOPAY_EMAIL;
+  const apiKey = process.env.EQOPAY_API_KEY?.trim();
+  const email = process.env.EQOPAY_EMAIL?.trim();
 
   if (!apiKey || !email) {
     logEvent(
       "ERROR",
-      "Missing environment variables: EQOPAY_API_KEY or EQOPAY_EMAIL is not set on Render."
+      "Missing environment variables: EQOPAY_API_KEY or EQOPAY_EMAIL is not set on Render.",
+      { hasApiKey: Boolean(apiKey), hasEmail: Boolean(email) }
     );
     return;
   }
@@ -94,9 +105,10 @@ async function sendSingleStkPush(item) {
     payload.account_number = item.accountNumber;
   }
 
-  logEvent("INFO", `Sending STK Push to ${item.msisdn}`, {
+  logEvent("INFO", `Calling EQOPAY /v1/stkpush for ${item.msisdn}`, {
     amount: payload.amount,
     reference: payload.reference,
+    email,
   });
 
   try {
@@ -112,11 +124,6 @@ async function sendSingleStkPush(item) {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    if (response.status === 304) {
-      logEvent("WARN", `Received HTTP 304 Not Modified for ${item.msisdn} (empty body)`);
-      return;
-    }
-
     const rawText = await response.text();
     let parsedBody;
     try {
@@ -125,11 +132,24 @@ async function sendSingleStkPush(item) {
       parsedBody = { rawResponse: rawText };
     }
 
-    if (!response.ok || String(parsedBody?.ResponseCode) !== "0") {
+    if (response.status === 304) {
+      logEvent("ERROR", `EQOPAY returned HTTP 304 for ${item.msisdn}`, {
+        status: response.status,
+        body: parsedBody,
+      });
+      return;
+    }
+
+    const accepted =
+      response.ok &&
+      (String(parsedBody?.ResponseCode) === "0" ||
+        String(parsedBody?.success) === "200");
+
+    if (!accepted) {
       knownErrorNumbers.add(item.msisdn);
       logEvent(
         "ERROR",
-        `EQOPAY API rejected request for ${item.msisdn} (HTTP ${response.status}) - marked as error number`,
+        `EQOPAY did not accept STK Push for ${item.msisdn} (HTTP ${response.status})`,
         parsedBody
       );
     } else {
@@ -141,16 +161,19 @@ async function sendSingleStkPush(item) {
     }
   } catch (err) {
     knownErrorNumbers.add(item.msisdn);
-    logEvent("ERROR", `Network/Fetch failure for ${item.msisdn} - marked as error number`, {
-      errorName: err.name,
-      errorMessage: err.message,
-      cause: err.cause ? String(err.cause) : undefined,
+    logEvent("ERROR", `Fetch/Network error sending STK Push to ${item.msisdn}`, {
+      errorName: err?.name,
+      errorMessage: err?.message,
+      cause: err?.cause ? String(err.cause) : undefined,
     });
   }
 }
 
 async function processQueue() {
-  if (isProcessing) return;
+  if (isProcessing) {
+    logEvent("INFO", `Queue worker already running. Pending: ${queue.length}`);
+    return;
+  }
   isProcessing = true;
   shouldStop = false;
 
@@ -166,6 +189,10 @@ async function processQueue() {
         await sleep(INTERVAL_MS);
       }
     }
+  } catch (err) {
+    logEvent("ERROR", "Unexpected error inside processQueue loop", {
+      errorMessage: err?.message || String(err),
+    });
   } finally {
     isProcessing = false;
     logEvent(
@@ -185,20 +212,53 @@ app.get("/health", (req, res) => {
     isProcessing,
     queuedCount: queue.length,
     knownErrorCount: knownErrorNumbers.size,
-    envConfigured: Boolean(process.env.EQOPAY_API_KEY && process.env.EQOPAY_EMAIL),
+    envConfigured: Boolean(
+      process.env.EQOPAY_API_KEY?.trim() && process.env.EQOPAY_EMAIL?.trim()
+    ),
   });
+});
+
+// Direct single-number test endpoint for fast Render log verification
+app.post("/api/test-stk", async (req, res) => {
+  const normalized = normalize254Number(req.body?.msisdn);
+  const amount = Math.max(1, Math.round(Number(req.body?.amount) || 1));
+
+  if (!normalized) {
+    logEvent("ERROR", "Test STK rejected: invalid phone number", {
+      raw: req.body?.msisdn,
+    });
+    return res.status(400).json({ error: "Invalid phone number." });
+  }
+
+  knownErrorNumbers.delete(normalized);
+  await sendSingleStkPush({
+    msisdn: normalized,
+    amount,
+    reference: `TEST-${Date.now().toString().slice(-6)}`,
+    accountNumber: req.body?.accountNumber ? String(req.body.accountNumber).trim() : "",
+  });
+
+  const latestLog = recentLogs[0] || null;
+  return res.status(200).json({ ok: true, msisdn: normalized, latestLog });
 });
 
 // Enqueue phone numbers (ignores invalid & previously errored numbers)
 app.post("/api/enqueue", (req, res) => {
   const { numbers, amount, referencePrefix, accountNumber } = req.body ?? {};
+  logEvent("INFO", "Received /api/enqueue request", {
+    rawCount: Array.isArray(numbers) ? numbers.length : 0,
+    amount,
+    referencePrefix,
+  });
 
   if (!Array.isArray(numbers)) {
+    logEvent("ERROR", "/api/enqueue rejected: numbers is not an array");
     return res.status(400).json({ error: "numbers must be an array." });
   }
 
   const numericAmount = Number(amount);
   if (!Number.isFinite(numericAmount) || numericAmount < 1) {
+    logEvent("ERROR", "/api/enqueue rejected: invalid amount", { amount });
     return res.status(400).json({ error: "Amount must be at least 1 KES." });
   }
 
@@ -210,27 +270,28 @@ app.post("/api/enqueue", (req, res) => {
   let duplicatesSkipped = 0;
 
   numbers.forEach((raw, idx) => {
-    const cleaned = String(raw ?? "").trim().replace(/^\+/, "");
-    if (!cleaned) return;
+    const trimmed = String(raw ?? "").trim();
+    if (!trimmed) return;
 
-    if (!isValid254Number(cleaned)) {
+    const normalized = normalize254Number(trimmed);
+    if (!normalized) {
       ignoredInvalidCount += 1;
       return;
     }
 
-    if (knownErrorNumbers.has(cleaned)) {
+    if (knownErrorNumbers.has(normalized)) {
       ignoredErrorCount += 1;
       return;
     }
 
-    if (seenInBatch.has(cleaned)) {
+    if (seenInBatch.has(normalized)) {
       duplicatesSkipped += 1;
       return;
     }
-    seenInBatch.add(cleaned);
+    seenInBatch.add(normalized);
 
     validItems.push({
-      msisdn: cleaned,
+      msisdn: normalized,
       amount: Math.round(numericAmount),
       reference: `${refBase}-${Date.now().toString().slice(-5)}-${idx + 1}`,
       accountNumber: accountNumber ? String(accountNumber).trim() : "",
@@ -280,7 +341,7 @@ app.get("/api/status", (req, res) => {
 
 app.listen(PORT, () => {
   logEvent("INFO", `EQOPAY STK Bot listening on port ${PORT}`);
-  if (!process.env.EQOPAY_API_KEY || !process.env.EQOPAY_EMAIL) {
+  if (!process.env.EQOPAY_API_KEY?.trim() || !process.env.EQOPAY_EMAIL?.trim()) {
     logEvent(
       "ERROR",
       "Startup Warning: EQOPAY_API_KEY or EQOPAY_EMAIL environment variable is missing!"
